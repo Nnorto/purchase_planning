@@ -965,17 +965,22 @@ class App(tk.Tk):
                  text="ROP = ADU · LT · (1 + k)        Q = ROP + N · ADU − остаток",
                  bg=p["surface"], fg=p["primary"],
                  font=("Consolas", 11, "bold")).pack(anchor="w", padx=22)
-        tk.Label(info,
-                 text="ADU — средняя дневная продажа за 14 дней   •   "
-                      "LT — срок поставки   •   k = 0,3 (страховой запас)   •   "
-                      "N = 7 дней (горизонт покрытия)",
-                 bg=p["surface"], fg=p["text_muted"],
-                 font=(Theme.FONT, 9), wraplength=900,
-                 justify="left").pack(anchor="w", padx=22, pady=(2, 14))
+        tk.Label(info, text=(
+            'где:\n'
+            '  ROP  — точка перезаказа: минимальный остаток, при котором нужно срочно делать заказ\n'
+            '  ADU  — среднедневные продажи за последние 14 дней (шт/день)\n'
+            '  LT   — срок поставки: сколько дней товар идёт от поставщика до склада\n'
+            '  k    — коэффициент страхового запаса = 0,3 (30% буфер на случай задержки)\n'
+            '  N    — горизонт покрытия = 7 дней (на сколько дней вперёд закупаем)\n'
+            '  Q    — рекомендуемое количество к заказу'
+        ),
+                 bg=p['surface'], fg=p['text_muted'],
+                 font=(Theme.FONT, 9), wraplength=1000, justify='left'
+                 ).pack(anchor='w', padx=22, pady=4, ipadx=0)
 
         card = self._card(wrap, fill="both", expand=True)
         cols = ("product", "stock", "adu", "rop", "qty", "supplier", "lt", "sum")
-        headers = ("Товар", "Остаток", "ADU", "Точка заказа",
+        headers = ("Товар", "Остаток", "Прод/день", "Точка заказа",
                    "К заказу", "Поставщик", "Срок, дн.", "Сумма, ₽")
         self.tree_plan = ttk.Treeview(card, columns=cols,
                                       show="headings", height=15)
@@ -1023,21 +1028,38 @@ class App(tk.Tk):
         self.status_var.set("План пересчитан")
 
     def _create_orders_from_plan(self):
+        self._refresh_plan()
         if not self._current_plan:
-            messagebox.showinfo("Информация",
-                                "Нет позиций для заказа — все остатки в норме")
+            messagebox.showinfo('', 'Нет позиций к заказу')
             return
+        cur = self.db.conn.cursor()
+        cur.execute(
+            "SELECT supplier_id FROM purchase_orders WHERE status = 'черновик'"
+        )
+        existing_drafts = {row[0] for row in cur.fetchall()}
+
         by_sup = {}
         for it in self._current_plan:
-            by_sup.setdefault(it["supplier_id"], []).append(
-                (it["product_id"], it["qty"]))
+            by_sup.setdefault(it['supplier_id'], []).append(
+                (it['product_id'], it['qty'])
+            )
+
+        skipped = []
         created = []
         for sid, items in by_sup.items():
+            if sid in existing_drafts:
+                skipped.append(sid)
+                continue
             created.append(self.db.save_purchase_order(sid, items))
-        messagebox.showinfo("Заявки созданы",
-                            f"Создано заявок: {len(created)}\n"
-                            f"Номера: {', '.join(map(str, created))}")
-        self.show_page("orders")
+
+        msg = ''
+        if created:
+            msg += f"Создано заявок: {len(created)}\nНомера: {', '.join(map(str, created))}\n"
+        if skipped:
+            msg += f"\nПропущено {len(skipped)} поставщиков — черновик уже существует.\nПерейдите в заказы!"
+
+        messagebox.showinfo('Готово', msg.strip())
+        self.show_page('orders')
 
     # ============================= ЗАЯВКИ =================================
     def _page_orders(self):
@@ -1049,6 +1071,9 @@ class App(tk.Tk):
         ttk.Button(header, text="✓  Принять поставку",
                    style="Success.TButton",
                    command=self._receive_order).pack(side="right", padx=4)
+        ttk.Button(header, text='🗑 Удалить черновик',
+                   style='Danger.TButton',
+                   command=self.delete_draft_order).pack(side='right', padx=4)
         ttk.Button(header, text="🔄  Обновить",
                    style="Secondary.TButton",
                    command=self._refresh_orders).pack(side="right", padx=4)
@@ -1114,6 +1139,8 @@ class App(tk.Tk):
         for i in self.tree_order_items.get_children():
             self.tree_order_items.delete(i)
 
+        self.status_var.set(f"Заявки обновлены — всего: {len(self.db.get_orders())}")
+
     def _show_order_items(self):
         sel = self.tree_orders.selection()
         if not sel:
@@ -1145,6 +1172,24 @@ class App(tk.Tk):
             self.status_var.set(f"Заявка №{oid} принята, остатки пополнены")
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+
+    def delete_draft_order(self):
+        sel = self.tree_orders.selection()
+        if not sel:
+            messagebox.showinfo('', 'Выберите заявку')
+            return
+        oid = self.tree_orders.item(sel[0])['values'][0]
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT status FROM purchase_orders WHERE id = ?", (oid,))
+        row = cur.fetchone()
+        if row[0] != 'черновик':
+            messagebox.showerror('Ошибка', 'Удалить можно только черновик')
+            return
+        if messagebox.askyesno('Удалить', f'Удалить черновик заявки №{oid}?'):
+            cur.execute("DELETE FROM purchase_orders WHERE id = ?", (oid,))
+            self.db.conn.commit()
+            self._refresh_orders()
+            self.status_var.set(f'Черновик №{oid} удалён')
 
     # =========================== ПОСТАВЩИКИ ===============================
     def _page_suppliers(self):
@@ -1200,7 +1245,7 @@ class App(tk.Tk):
 
     def _add_product_dialog(self):
         p = self.palette
-        dlg = self._modal("Новый товар", 420, 400)
+        dlg = self._modal("Новый товар", 480, 500)
 
         tk.Label(dlg, text="Новый товар", bg=p["surface"], fg=p["text"],
                  font=(Theme.FONT, 14, "bold")).pack(anchor="w",
@@ -1292,7 +1337,7 @@ class App(tk.Tk):
 
     def _add_supplier_dialog(self):
         p = self.palette
-        dlg = self._modal("Новый поставщик", 420, 290)
+        dlg = self._modal("Новый поставщик", 480, 350)
 
         tk.Label(dlg, text="Новый поставщик", bg=p["surface"], fg=p["text"],
                  font=(Theme.FONT, 14, "bold")).pack(anchor="w",
